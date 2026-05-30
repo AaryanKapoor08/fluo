@@ -104,6 +104,123 @@
   authoritative vetting sources. Persist React Flow workflow changes. Log every decision as a signed event. Anchor batches using Merkle roots to a permissioned ledger or WORM
   audit store. Add reconciliation jobs, RBAC, security monitoring, backups, and records-retention controls.
 
+  ## Section 1A - Blockchain / Tech Stack Deep-Dive Questions
+
+  1. What exactly is the blockchain stack in this demo?
+
+  The blockchain stack is Solidity for the contract, Hardhat for the local Ethereum-compatible development chain, ethers.js for the server-side RPC client, and a Next.js API
+  route as the bridge between the UI/risk engine and the chain. The browser does not call the contract directly. The API route calls ledger.ts, ledger.ts hashes the payload,
+  loads the deployed contract address from data/contract-address.json, connects to http://127.0.0.1:8545 with ethers.JsonRpcProvider, uses Hardhat signer 0, and calls
+  logEvent().
+
+  2. Why does the frontend not call the blockchain directly?
+
+  Because this is not a wallet-driven consumer dApp. The event must be created after the server-side risk engine reads internal procurement data. If the frontend called the
+  contract directly, a user could bypass the API decision path and emit whatever event they wanted. In the demo that is still possible from another client because the contract
+  has no access control, but the intended architecture is server-mediated: UI action -> API validation -> risk evaluation -> ledger write.
+
+  3. What is ethers.js doing here?
+
+  ethers.js is the TypeScript library used to talk to the local Ethereum JSON-RPC endpoint. It creates a provider for the Hardhat node, gets the first local signer, builds a
+  Contract object from the deployed address and ABI, submits the logEvent transaction, waits for the receipt, and returns the transaction hash. It is not doing the risk logic
+  and it is not storing the readable audit record.
+
+  4. What ABI does the server use, and what is missing from it?
+
+  The server uses a minimal ABI containing only logEvent. That is enough to submit transactions but not enough to decode AuditLogged events or call getEventCount from this
+  path. The local cache assigns event IDs based on JSON length rather than reading the contract counter. In production, the server or indexer should decode emitted events and
+  reconcile local IDs with block number, transaction hash, log index, and chain eventId.
+
+  5. What does the transaction hash prove?
+
+  It proves that a transaction with that hash was submitted and included on the connected chain, assuming the RPC endpoint is honest and the receipt is real. In this demo, the
+  chain is local Hardhat, so the transaction hash is useful for demonstrating flow but not for independent assurance. A judge should not treat a local transaction hash as
+  evidence accepted by a third party.
+
+  6. What happens when ledger.ts cannot reach the chain?
+
+  writeOnLocalChain returns null, and appendLedgerEvents still writes an event to ledger-events-cache.json using a fallback transactionHash like local-chain-event-0001. That
+  keeps the demo moving, but it weakens the integrity claim. A production version should mark the event as unanchored, retry from an outbox, and prevent users from confusing
+  a local fallback ID with a real chain transaction hash.
+
+  7. Is eventId guaranteed to match between JSON and Solidity?
+
+  No. Solidity increments eventCount on-chain, while the local cache sets eventId using existingEvents.length + index + 1. If a chain write succeeds but JSON writing fails, or
+  if JSON is edited manually, the two counters can diverge. The production fix is to parse the AuditLogged event from the transaction receipt and store the chain's eventId
+  alongside the local record.
+
+  8. Why is the contract using events instead of a mapping or array?
+
+  Events are cheaper and are the normal way to create an append-only audit stream on EVM chains. The tradeoff is that contracts cannot easily query past logs by themselves.
+  You need an off-chain indexer or cache. That is why ledger-events-cache.json exists in the demo: it is the human-readable projection of the on-chain event stream.
+
+  9. What is the issue with indexed string parameters in Solidity?
+
+  Dynamic types like string are hashed when indexed in event topics. That means projectId and entityId are useful for topic filtering only if the indexer knows the exact string
+  to hash. They are not readable directly from the indexed topic. For production, fixed-size bytes32 IDs or numeric IDs would be more efficient and predictable than raw
+  strings.
+
+  10. Why use SHA-256 in Node instead of keccak256 in Solidity?
+
+  The demo computes the payload hash off-chain using Node crypto with SHA-256 because the full payload stays off-chain and only the digest goes to Solidity. That is fine if
+  the system clearly defines the canonical payload string and hash algorithm. In an EVM-native design, keccak256 is more conventional, but SHA-256 is widely understood and
+  acceptable for audit commitments if consistently implemented.
+
+  11. What is stableStringify solving?
+
+  JSON object key order can vary, which would produce different hashes for semantically identical payloads. stableStringify sorts object keys recursively so the same payload
+  structure produces the same hash. It is still a custom canonicalization scheme, so production should version it, test it, and avoid ambiguous values like undefined, NaN, or
+  types that JSON does not represent cleanly.
+
+  12. Are timestamps coming from the blockchain or the server?
+
+  Both exist, but they are not reconciled. The Solidity event emits block.timestamp. The JSON cache stores new Date().toISOString() from the server. Those can differ. In
+  production, the audit record should store both server-received time and chain-included time, and the UI should label them clearly.
+
+  13. What private key signs the transaction?
+
+  In the demo, ethers gets signer 0 from the local Hardhat node. That is a development account, not a procurement officer key and not a secure service account. In production,
+  keys would need to be held in HSM/KMS or an approved wallet custody model, with rotation, audit, role mapping, and separation between human approval identity and service
+  submission identity.
+
+  14. What happens if the contract is redeployed?
+
+  The app reads a single address from data/contract-address.json. If the contract is redeployed and the file is changed, old events live under the old contract address and new
+  events under the new one. The cache currently does not model multiple deployments. A real system should include chainId, contractAddress, deployment version, ABI version,
+  and migration history on every ledger event.
+
+  15. Why not use Hyperledger Fabric, Corda, or a normal database?
+
+  For a real defence workflow, permissioned infrastructure or a signed append-only database may be more realistic than a public EVM chain. Hardhat/Solidity was chosen because
+  it is fast for a 24-hour hackathon and clearly demonstrates tamper-evident event anchoring. The honest answer is that blockchain is a replaceable ledger layer; the core
+  product value is workflow assurance and cross-project risk propagation.
+
+  16. What chain guarantees do you lose by running on Hardhat?
+
+  You lose independent consensus, durable network history, adversarial validator assumptions, realistic finality, and credible third-party verification. Hardhat gives a
+  programmable local EVM for development. It proves that the app can submit and hash events; it does not prove production immutability.
+
+  17. How would you make the blockchain layer production-grade?
+
+  Add access-controlled writer roles, signed event envelopes, schema/version fields, idempotency keys, receipt parsing, event indexing, chain/cache reconciliation, deployment
+  versioning, monitored RPC endpoints, key management, and a decision on whether the ledger is permissioned EVM, enterprise ledger, WORM storage, or Merkle-root anchoring to an
+  external chain.
+
+  18. What would you say if a judge says, "This is not really blockchain because the readable data is in JSON"?
+
+  The correct answer is that the blockchain is not meant to hold the readable procurement file. It holds audit commitments and event metadata. Sensitive procurement details
+  should remain off-chain. The weakness in the demo is not the off-chain data pattern; the weakness is that the local JSON cache and local Hardhat chain are controlled by the
+  same environment and are not independently reconciled.
+
+  19. What is the biggest blockchain-specific attack surface here?
+
+  Unauthorized event submission, fake or stale contract addresses, compromised local signer, RPC endpoint spoofing, cache/chain divergence, replayed duplicate events, and
+  misleading fallback transaction hashes. The UI also currently trusts the API response without independently verifying the chain receipt.
+
+  20. What is the clean one-sentence explanation of the blockchain value in ChainOps?
+
+  ChainOps uses the blockchain as a tamper-evident audit anchor for supplier-risk workflow events, while keeping sensitive procurement details off-chain in operational storage.
+
   ## Section 2 — Business, Policy, and Strategy Questions
 
   1. Who is the real buyer?
